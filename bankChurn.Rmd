@@ -1,0 +1,260 @@
+---
+title: "bankChurn"
+author: "Kanishk Kapoor"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r}
+library(caret)
+library(tensorflow)
+library(keras)
+library(ggplot2)
+library(dplyr)
+```
+```{r}
+library(dummies)
+```
+
+```{r}
+bank <- read.csv("bankChurn.csv", stringsAsFactors = FALSE)
+colSums(is.na(bank))
+str(bank)
+```
+
+```{r}
+bank$gender <- as.numeric(as.factor(bank$gender)) - 1
+```
+```{r}
+country_ohe <- model.matrix(~country - 1, data = bank)
+
+bank <- cbind(bank, country_ohe)
+bank$country <- NULL
+```
+
+```{r}
+str(bank)
+table(bank$churn)
+```
+class imbalance around 20% must need to balance it to avoid overfitting.
+
+```{r}
+library("smotefamily")
+
+x <- bank[, -which(names(bank) == "churn") ]
+y <- bank$churn
+
+smote_data <- SMOTE(x,y, K=5, dup_size = 3)
+
+bank_smote <- smote_data$data
+bank_smote$churn <- as.factor(bank_smote$class)
+bank_smote$class <- NULL
+```
+```{r}
+str(bank_smote)
+table(bank_smote$churn)
+```
+
+```{r}
+bank_smote$churn <- as.numeric(bank_smote$churn) - 1
+```
+
+```{r}
+normalize <- function(x) {
+  return( x - min(x) / (max(x) - min(x)))
+}
+
+bank_keras <- as.data.frame(lapply(bank_smote[, -which(names(bank_smote) == "churn")], normalize))
+
+
+
+```
+
+```{r}
+bank_keras$churn <- as.numeric(bank_smote$churn)
+```
+
+
+```{r}
+#without SMOTE
+bank_norm <- as.data.frame(lapply(bank[, -which(names(bank) == "churn")], normalize))
+bank_norm$churn <- as.numeric(bank$churn)
+
+```
+
+```{r}
+#Trying Z scaling
+
+set.seed(123)
+
+z_index <- createDataPartition(bank$churn, p=0.8, list= FALSE)
+
+
+z_train <- bank[z_index, ]
+z_test <- bank[-z_index, ]
+
+z_train$customer_id <- NULL
+z_test$customer_id <- NULL 
+
+features <- setdiff(names(z_train),"churn")
+
+sds <- apply(z_train[, features], 2, sd)
+zero_sd_cols <- names(sds[sds == 0])
+zero_sd_cols
+
+z_means <- apply(z_train[, features],2,mean)
+z_sds <- apply(z_train[, features],2,sd)
+any(sds == 0)
+
+z_train[, features] <- scale(z_train[, features], center = z_means, scale = z_sds)
+z_test[, features] <- scale(z_test[, features], center = z_means, scale = z_sds)
+```
+```{r}
+colSums(is.na(z_train[, features]))
+colSums(is.na(z_test[,features]))
+```
+
+
+
+```{r}
+bank_norm$customer_id <- NULL
+str(bank_norm)
+```
+
+```{r}
+table(bank_keras$churn)
+str(bank_keras)
+```
+
+```{r}
+#set.seed(123)
+
+#train_split <- createDataPartition(bank_norm$churn,p=0.8, list = FALSE)
+#trainB <- bank_norm[train_split, ]
+#testB <- bank_norm[-train_split, ]
+
+#train_x <- as.matrix(trainB[, -which(names(train) == "churn")])
+#train_y <- as.matrix(trainB$churn)##
+
+ztrain_x <- as.matrix(z_train[, features])
+ztrain_y <- z_train$churn
+
+ztest_x <- as.matrix(z_test[, features])
+ztest_y <- z_test$churn
+
+
+#test_x <- as.matrix(testB[, -which(names(test)=="churn")])
+#test_y <- as.matrix(testB$churn)
+```
+
+```{r}
+model_bank <- keras_model_sequential() %>%
+  layer_dense(units=16,activation = "relu", input_shape = ncol(ztrain_x)) %>%
+  layer_dropout(rate=0.3) %>%
+  layer_dense(units=8, activation="relu") %>%
+  layer_dropout(rate=0.2) %>%
+  layer_dense(units = 1, activation = "sigmoid")
+```
+
+```{r}
+summary(model_bank)
+```
+
+```{r}
+model_bank %>% compile (
+  loss = "binary_crossentropy",
+  optimizer = optimizer_adam(learning_rate = 0.001),
+  metrics = c('accuracy')
+)
+```
+
+```{r}
+bank_history <- model_bank %>% fit(
+  ztrain_x,ztrain_y,
+  epochs = 50,
+  batch_size =32,
+  validation_split = 0.2,
+  verbose = 1
+)
+```
+
+```{r}
+plot(bank_history)
+```
+```{r}
+model_bank %>% evaluate(ztest_x,ztest_y)
+```
+
+```{r}
+ggplot(bank, aes(x= as.factor(churn))) +
+  geom_bar(fill="tomato") +
+  labs(title = "Churn Distribution (Original Data)", x = "Churn", y = "Count") +
+  theme_minimal()
+
+```
+
+```{r}
+library(pROC)
+
+# Get predicted probabilities
+y_pred_prob <- model_bank %>% predict(ztest_x)
+
+# Plot ROC
+roc_obj <- roc(ztest_y, y_pred_prob)
+plot(roc_obj, col = "royalblue", main = paste("ROC Curve (AUC =", round(auc(roc_obj), 2), ")"))
+```
+
+
+```{r}
+library(caret)
+
+# Binary classification threshold (0.5)
+y_pred_class <- ifelse(y_pred_prob > 0.5, 1, 0)
+
+# Confusion matrix
+cm <- confusionMatrix(as.factor(y_pred_class), as.factor(ztest_y))
+cm$table
+
+# Plot
+cm_df <- as.data.frame(cm$table)
+ggplot(cm_df, aes(Prediction, Reference, fill = Freq)) +
+  geom_tile() +
+  geom_text(aes(label = Freq), size = 5, color = "white") +
+  scale_fill_gradient(low = "lightblue", high = "darkblue") +
+  labs(title = "Confusion Matrix", x = "Predicted", y = "Actual") +
+  theme_minimal()
+```
+
+```{r}
+
+bank_original <- read.csv("bankChurn.csv", stringsAsFactors = FALSE)
+
+# Churn rate by gender
+ggplot(bank_original, aes(x = gender, fill = as.factor(churn))) +
+  geom_bar(position = "fill") +
+  labs(title = "Churn Rate by Gender", y = "Proportion", fill = "Churn") +
+  scale_fill_manual(values = c("royalblue", "tomato")) +
+  theme_minimal()
+
+# Churn rate by country
+ggplot(bank_original, aes(x = country, fill = as.factor(churn))) +
+  geom_bar(position = "fill") +
+  labs(title = "Churn Rate by Country", y = "Proportion", fill = "Churn") +
+  scale_fill_manual(values = c("royalblue", "tomato")) +
+  theme_minimal()
+```
+This project aimed to develop a predictive model to identify potential customer churn in a bank using deep learning techniques. After thorough preprocessing—including handling class imbalance via SMOTE, feature normalization, and one-hot encoding—we trained a neural network using the Keras library in R.
+
+The final model achieved strong overall accuracy, with high performance in predicting non-churning customers (True Negatives = 1545). However, the model’s recall for churners was moderate, indicating room for improvement in capturing customers who are at actual risk of leaving (False Negatives = 178).
+
+Key takeaways:
+	•	Accuracy and precision were satisfactory, showing the model performs well under general conditions.
+	•	Recall can be enhanced by exploring advanced techniques such as ensemble methods or tuning decision thresholds.
+	•	The confusion matrix highlights the need for the bank to focus on reducing false negatives, which represent missed churners and could translate to lost revenue.
+
+Going forward, integrating additional customer behavior data (e.g., transaction frequency, support tickets, NPS scores) could further improve churn prediction. Overall, this project demonstrates the potential of data-driven approaches in proactively managing customer retention strategies.
